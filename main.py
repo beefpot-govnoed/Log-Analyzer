@@ -39,53 +39,297 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
-def analyze_group(self, group: Dict) -> str:
-        """Analyze log group using LLM with structured data (OPTIMIZED)"""
+# @title 3. Core Analyzer Class (OPTIMIZED - Fast)
+class LogAnalyzer:
+    """
+    AI-powered log analyzer using CyberSecQwen-4B
+    """
 
-        # Prepare structured summary
+    # Known security event types
+    SECURITY_EVENT_TYPES = [
+        'DDOS', 'XSS', 'SQL_INJECTION', 'SCALE_INJECTION', 'TG',
+        'MALWARE', 'PHISHING', 'RANSOMWARE', 'BRUTE_FORCE', 'PORT_SCAN',
+        'BACKDOOR', 'CMD_INJECTION', 'PATH_TRAVERSAL', 'CSRF', 'SSRF'
+    ]
+
+    def __init__(self):
+        print("Loading models...")
+
+        # Load CyberSecQwen-4B
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+            device_map="auto" if DEVICE == "cuda" else None,
+            low_cpu_mem_usage=True
+        )
+
+        # Load embedding model for clustering
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+        # Regex patterns for structured field extraction
+        self.field_patterns = {
+            'level': re.compile(r'\b(?:level|severity|log_level)\s*[=:]\s*(\w+)', re.IGNORECASE),
+            'type': re.compile(r'\b(?:type|event_type|attack_type|threat_type)\s*[=:]\s*(\w+)', re.IGNORECASE),
+            'source_ip': re.compile(r'\b(?:source_ip|src_ip|from_ip|client_ip)\s*[=:]\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', re.IGNORECASE),
+            'dest_ip': re.compile(r'\b(?:dest_ip|dst_ip|to_ip|server_ip|target_ip)\s*[=:]\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', re.IGNORECASE),
+            'status': re.compile(r'\b(?:status|status_code|http_status)\s*[=:]\s*(\w+)', re.IGNORECASE),
+            'request_id': re.compile(r'\b(?:request_id|req_id|trace_id|transaction_id)\s*[=:]\s*([\w-]+)', re.IGNORECASE),
+            'port': re.compile(r'\b(?:port|dst_port|target_port)\s*[=:]\s*(\d+)', re.IGNORECASE),
+            'protocol': re.compile(r'\b(?:protocol|proto)\s*[=:]\s*(\w+)', re.IGNORECASE),
+            'action': re.compile(r'\b(?:action|response_action|firewall_action)\s*[=:]\s*(\w+)', re.IGNORECASE),
+            'threat_label': re.compile(r'\b(?:threat_label|label|classification)\s*[=:]\s*(\w+)', re.IGNORECASE),
+            'path': re.compile(r'\b(?:path|url|endpoint|uri)\s*[=:]\s*(\S+)', re.IGNORECASE),
+            'method': re.compile(r'\b(?:method|http_method)\s*[=:]\s*(\w+)', re.IGNORECASE),
+        }
+
+        print("Models loaded successfully!")
+
+    def extract_structured_fields(self, line: str) -> Dict:
+        """Extract structured fields from log line using regex"""
+        fields = {}
+
+        for field_name, pattern in self.field_patterns.items():
+            match = pattern.search(line)
+            if match:
+                fields[field_name] = match.group(1).strip()
+
+        return fields
+
+    def extract_level(self, line: str, fields: Optional[Dict] = None) -> str:
+        """Extract severity level with priority to structured fields"""
+        if fields is None:
+            fields = self.extract_structured_fields(line)
+
+        # Priority 1: explicit level field
+        if 'level' in fields:
+            level_raw = fields['level'].upper()
+            if level_raw in ['CRITICAL', 'FATAL', 'SEVERE', 'EMERGENCY', 'ALERT']:
+                return 'CRITICAL'
+            elif level_raw in ['ERROR', 'ERR', 'FAIL', 'FAILURE']:
+                return 'ERROR'
+            elif level_raw in ['WARNING', 'WARN']:
+                return 'WARNING'
+            elif level_raw in ['INFO', 'DEBUG', 'TRACE', 'NOTICE']:
+                return 'INFO'
+
+        # Priority 2: keyword search
+        line_lower = line.lower()
+
+        if any(word in line_lower for word in ['critical', 'fatal', 'severe', 'emergency']):
+            return 'CRITICAL'
+        elif any(word in line_lower for word in ['error', 'fail', 'exception', 'denied', 'blocked']):
+            return 'ERROR'
+        elif any(word in line_lower for word in ['warn', 'warning', 'suspicious', 'unusual']):
+            return 'WARNING'
+        else:
+            return 'INFO'
+
+    def extract_security_event_type(self, line: str, fields: Optional[Dict] = None) -> Optional[str]:
+        """Extract security event type from log line"""
+        if fields is None:
+            fields = self.extract_structured_fields(line)
+
+        if 'type' in fields:
+            type_raw = fields['type'].upper()
+            for event_type in self.SECURITY_EVENT_TYPES:
+                if event_type in type_raw or type_raw in event_type:
+                    return event_type
+
+        if 'threat_label' in fields:
+            label_raw = fields['threat_label'].upper()
+            for event_type in self.SECURITY_EVENT_TYPES:
+                if event_type in label_raw or label_raw in event_type:
+                    return event_type
+
+        line_upper = line.upper()
+        for event_type in self.SECURITY_EVENT_TYPES:
+            if event_type in line_upper:
+                return event_type
+
+        return None
+
+    def extract_timestamp(self, line: str) -> str:
+        """Extract timestamp from log line"""
+        patterns = [
+            r'\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}',
+            r'\d{2}/\w+/\d{4}:\d{2}:\d{2}:\d{2}',
+            r'\w+\s+\d+\s+\d+:\d+:\d+'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, line)
+            if match:
+                return match.group(0)
+
+        return 'unknown'
+
+    def parse_logs(self, content: str) -> List[Dict]:
+        """Parse logs and extract structured information"""
+        lines = content.strip().split('\n')
+
+        important_logs = []
+        total_lines = len(lines)
+
+        print(f"Parsing {total_lines} lines...")
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            fields = self.extract_structured_fields(line)
+            level = self.extract_level(line, fields)
+            event_type = self.extract_security_event_type(line, fields)
+
+            if level in ['ERROR', 'CRITICAL', 'WARNING']:
+                important_logs.append({
+                    'level': level,
+                    'message': line,
+                    'timestamp': self.extract_timestamp(line),
+                    'fields': fields,
+                    'event_type': event_type
+                })
+
+        return important_logs
+
+    def analyze_ngrams(self, logs: List[Dict], top_k: int = 20, sample_size: int = 500) -> Dict:
+        """Optimized n-gram analysis"""
+        if len(logs) > sample_size:
+            step = len(logs) // sample_size
+            sampled_logs = logs[::step][:sample_size]
+        else:
+            sampled_logs = logs
+
+        pattern_counter = Counter()
+
+        for log in sampled_logs:
+            fields = log.get('fields', {})
+            event_type = log.get('event_type')
+
+            if event_type:
+                pattern_counter[f"type={event_type}"] += 1
+
+            key_fields = ['level', 'source_ip', 'dest_ip', 'status', 'action', 'protocol']
+            field_parts = []
+            for field_name in key_fields:
+                if field_name in fields:
+                    field_parts.append(f"{field_name}={fields[field_name]}")
+
+            if field_parts:
+                pattern_counter[' '.join(field_parts)] += 1
+
+        meaningful_patterns = {p: c for p, c in pattern_counter.items() if c >= 2}
+        top_patterns = sorted(meaningful_patterns.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+        return {
+            'total_unique_patterns': len(meaningful_patterns),
+            'top_ngrams': [{'pattern': pattern, 'count': count}
+                          for pattern, count in top_patterns],
+            'sample_size': len(sampled_logs)
+        }
+
+    def group_similar_logs(self, logs: List[Dict]) -> List[Dict]:
+        """Group logs by security event type first"""
+        if len(logs) > MAX_LOGS_FOR_ANALYSIS:
+            logs = logs[:MAX_LOGS_FOR_ANALYSIS]
+
+        type_groups = defaultdict(list)
+        untyped_logs = []
+
+        for log in logs:
+            if log.get('event_type'):
+                type_groups[log['event_type']].append(log)
+            else:
+                untyped_logs.append(log)
+
+        result_groups = []
+
+        for event_type, group_logs in type_groups.items():
+            level_counts = defaultdict(int)
+            for log in group_logs:
+                level_counts[log['level']] += 1
+
+            result_groups.append({
+                'group_id': f"type_{event_type}",
+                'event_type': event_type,
+                'size': len(group_logs),
+                'levels': dict(level_counts),
+                'samples': group_logs[:3],
+                'logs': group_logs
+            })
+
+        if untyped_logs:
+            max_untyped = min(len(untyped_logs), 2000)
+            untyped_sample = untyped_logs[:max_untyped]
+
+            messages = [log['message'] for log in untyped_sample]
+            embeddings = self.embedder.encode(messages, show_progress_bar=True,
+                                             batch_size=EMBEDDING_BATCH_SIZE)
+
+            clustering = DBSCAN(eps=0.3, min_samples=2, metric='cosine')
+            clusters = clustering.fit_predict(embeddings)
+
+            untyped_groups = defaultdict(list)
+            for idx, cluster_id in enumerate(clusters):
+                if cluster_id != -1:
+                    untyped_groups[f"cluster_{cluster_id}"].append(untyped_sample[idx])
+                else:
+                    untyped_groups[f"unique_{idx}"].append(untyped_sample[idx])
+
+            for group_id, group_logs in untyped_groups.items():
+                level_counts = defaultdict(int)
+                for log in group_logs:
+                    level_counts[log['level']] += 1
+
+                result_groups.append({
+                    'group_id': group_id,
+                    'event_type': 'UNKNOWN',
+                    'size': len(group_logs),
+                    'levels': dict(level_counts),
+                    'samples': group_logs[:3],
+                    'logs': group_logs
+                })
+
+        result_groups.sort(key=lambda x: x['size'], reverse=True)
+
+        return result_groups
+
+    def analyze_group(self, group: Dict) -> str:
+        """Fast LLM analysis with structured fallback"""
+
         event_type = group.get('event_type', 'UNKNOWN')
         size = group['size']
         levels = group.get('levels', {})
 
-        # Extract common fields from group (limit for speed)
-        field_summary = defaultdict(Counter)
-        for log in group.get('logs', group.get('samples', []))[:10]:  # Limit to 10 samples
-            for field_name, field_value in log.get('fields', {}).items():
-                field_summary[field_name][field_value] += 1
+        # Extract source IPs
+        source_ips = set()
+        paths = set()
+        for log in group.get('logs', [])[:50]:
+            fields = log.get('fields', {})
+            if 'source_ip' in fields:
+                source_ips.add(fields['source_ip'])
+            if 'path' in fields:
+                paths.add(fields['path'])
 
-        # Get most common values for each field
-        common_fields = {}
-        for field_name, counter in field_summary.items():
-            common_fields[field_name] = counter.most_common(2)
+        ip_text = ", ".join(list(source_ips)[:5]) if source_ips else "Unknown"
+        path_text = ", ".join(list(paths)[:5]) if paths else "Unknown"
 
-        # Prepare sample messages (limit to 2)
-        samples_text = "\n".join([f"- {log['message'][:200]}"
-                                  for log in group.get('samples', [])[:2]])
+        # Build compact prompt
+        prompt = f"""Event: {event_type}
+Count: {size}
+Levels: {levels}
+Source IPs: {ip_text}
+Paths: {path_text}
 
-        # Prepare field summary text
-        fields_text = ""
-        for field_name, values in common_fields.items():
-            values_str = ", ".join([f"{val} ({count})" for val, count in values])
-            fields_text += f"  {field_name}: {values_str}\n"
-
-        prompt = f"""Analyze security events:
-Type: {event_type}, Count: {size}, Levels: {levels}
-
-Fields:
-{fields_text if fields_text else "  None"}
-
-Samples:
-{samples_text}
-
-Answer briefly:
+Answer in 3 short lines:
 1. Attack type
-2. Severity (low/medium/high/critical)
-3. Actions needed"""
+2. Severity
+3. Action"""
 
         try:
-            # Format prompt for Qwen chat
             messages = [
-                {"role": "system", "content": "You are a cybersecurity expert. Be concise."},
+                {"role": "system", "content": "Cybersecurity expert. Answer briefly."},
                 {"role": "user", "content": prompt}
             ]
 
@@ -102,30 +346,83 @@ Answer briefly:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=150,  # Reduced from 400 to 150
-                    temperature=0.3,     # Reduced for faster generation
-                    do_sample=False,     # Greedy decoding is faster
-                    num_beams=1,         # No beam search
+                    max_new_tokens=120,
+                    temperature=0.5,
+                    do_sample=True,
+                    top_p=0.9,
+                    repetition_penalty=1.2,
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
 
-            # Decode only the new tokens
             input_length = inputs['input_ids'].shape[1]
             response_tokens = outputs[0][input_length:]
             response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
 
-            # Clean up
             response = response.strip()
 
-            if len(response) < 10:
-                return self._generate_fallback_analysis(group)
+            # Clean raw logs from response
+            response_lines = []
+            for line in response.split('\n'):
+                line = line.strip()
+                if any(x in line for x in ['level=', 'service=', 'pid=', 'request_id=', 'SECURITY_ALERT']):
+                    continue
+                if line.startswith(('2026-', '2025-', '2024-')):
+                    continue
+                if line:
+                    response_lines.append(line)
+
+            response = '\n'.join(response_lines).strip()
+
+            if len(response) < 20:
+                return self._generate_fallback_analysis(group, source_ips, path_text)
 
             return response
 
         except Exception as e:
-            print(f"Error: {e}")
-            return self._generate_fallback_analysis(group)
+            print(f"LLM error: {e}")
+            return self._generate_fallback_analysis(group, source_ips, path_text)
+
+    def _generate_fallback_analysis(self, group: Dict, source_ips: set = None, path_text: str = "Unknown") -> str:
+        """Structured fallback analysis"""
+        event_type = group.get('event_type', 'UNKNOWN')
+        size = group['size']
+        levels = group.get('levels', {})
+
+        severity = 'medium'
+        if 'CRITICAL' in levels:
+            severity = 'critical'
+        elif 'ERROR' in levels:
+            severity = 'high'
+        elif 'WARNING' in levels:
+            severity = 'medium'
+
+        attack_info = {
+            'DDOS': ('Distributed Denial of Service attack',
+                     'Rate limiting, IP blocking, traffic filtering'),
+            'XSS': ('Cross-Site Scripting attack',
+                    'Input sanitization, CSP headers, WAF rules'),
+            'SCALE_INJECTION': ('Resource scaling attack',
+                                'Authentication, rate limits, resource quotas'),
+            'TG': ('Threat group activity',
+                   'Monitor traffic, update threat intelligence, block suspicious IPs'),
+            'UNKNOWN': ('Unknown or unclassified event',
+                        'Manual review required, check patterns')
+        }
+
+        if event_type in attack_info:
+            description, actions = attack_info[event_type]
+        else:
+            description, actions = attack_info['UNKNOWN']
+
+        ip_text = ", ".join(list(source_ips)[:5]) if source_ips else "Unknown"
+
+        return f"""1. Attack: {event_type} - {description}
+2. Severity: {severity}
+3. Events: {size} ({levels})
+4. Source IPs: {ip_text}
+5. Paths: {path_text}
+6. Actions: {actions}"""
 
 # @title 4. Analysis Function
 def analyze_log_content(analyzer: LogAnalyzer, content: str) -> Dict:
@@ -255,97 +552,150 @@ for filename in uploaded.keys():
         import traceback
         traceback.print_exc()
 
-# @title 6. Display Analysis Results
+# @title 6. Display Analysis Results (With Charts)
 import matplotlib.pyplot as plt
+import textwrap
+
+def clean_analysis_text(text: str) -> str:
+    """Clean and format analysis text"""
+    if not text:
+        return "No analysis available"
+
+    # Remove raw log lines and prompt remnants
+    lines = text.split('\n')
+    cleaned_lines = []
+
+    for line in lines:
+        line = line.strip()
+
+        # Skip empty lines at start
+        if not line and not cleaned_lines:
+            continue
+
+        # Skip raw log data
+        if line.startswith(('2026-', '2025-', '2024-', '2023-', 'action=', 'msg=', 'service=', 'pid=')):
+            continue
+
+        # Skip markdown artifacts
+        if line.startswith('###') or line.startswith('---'):
+            continue
+
+        # Skip lines that are just repeated log fragments
+        if 'level=' in line and 'service=' in line and 'pid=' in line:
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned_text = '\n'.join(cleaned_lines)
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+
+    return cleaned_text.strip()
 
 def display_results(results: Dict):
-    """Display analysis results in a readable format"""
+    """Display analysis results with charts"""
 
     if not results:
         print("No results to display")
         return
 
     print("\n" + "="*70)
-    print("ANALYSIS REPORT")
+    print("🔒 LOG ANALYSIS REPORT")
     print("="*70)
 
-    print(f"\nTotal lines: {results.get('total_lines', 'N/A')}")
-    print(f"Important events: {results.get('total_important', 0)}")
-    print(f"Error groups: {results.get('total_groups', 0)}")
+    # Summary statistics
+    print(f"\n📊 Summary:")
+    print(f"  • Total lines: {results.get('total_lines', 'N/A')}")
+    print(f"  • Important events: {results.get('total_important', 0)}")
+    print(f"  • Error groups: {results.get('total_groups', 0)}")
 
     # Severity statistics
     print("\n" + "-"*40)
-    print("SEVERITY LEVELS")
+    print("⚠️ SEVERITY LEVELS")
     print("-"*40)
 
     severity_emoji = {'CRITICAL': '⛔', 'ERROR': '🔴', 'WARNING': '⚠️'}
     level_stats = results.get('level_stats', {})
-
-    # Filter out None keys
     level_stats = {k: v for k, v in level_stats.items() if k is not None}
 
     for level, count in sorted(level_stats.items(), key=lambda x: -x[1]):
         percentage = (count / results['total_important']) * 100 if results['total_important'] > 0 else 0
-        print(f"  {severity_emoji.get(level, '•')} {level}: {count} ({percentage:.1f}%)")
+        bar = '█' * int(percentage / 2)
+        print(f"  {severity_emoji.get(level, '•')} {level:10s}: {count:5d} ({percentage:5.1f}%) {bar}")
 
     # Security event types
     event_type_stats = results.get('event_type_stats', {})
-
-    # Filter out None keys
-    event_type_stats = {k: v for k, v in event_type_stats.items() if k is not None}
+    event_type_stats = {k: v for k, v in event_type_stats.items() if k is not None and k != 'UNKNOWN'}
 
     if event_type_stats:
         print("\n" + "-"*40)
-        print("SECURITY EVENT TYPES")
+        print("🎯 SECURITY EVENT TYPES")
         print("-"*40)
 
         for event_type, count in sorted(event_type_stats.items(), key=lambda x: -x[1]):
             percentage = (count / results['total_important']) * 100 if results['total_important'] > 0 else 0
-            print(f"  🎯 {event_type}: {count} ({percentage:.1f}%)")
+            bar = '█' * int(percentage)
+            print(f"  {event_type:20s}: {count:5d} ({percentage:5.1f}%) {bar}")
 
-    # Visualization - Severity
+    # ============ CHARTS ============
+
+    # Chart 1: Severity Distribution
     if level_stats:
-        try:
-            plt.figure(figsize=(8, 5))
-            levels = [str(l) for l in level_stats.keys()]  # Convert to string
-            counts = [int(c) for c in level_stats.values()]  # Convert to int
+        plt.figure(figsize=(8, 5))
+        levels = [str(l) for l in level_stats.keys()]
+        counts = [int(c) for c in level_stats.values()]
 
-            colors = ['#ff4444' if 'CRITICAL' in l else
-                     '#ff6b6b' if 'ERROR' in l else
-                     '#ffa500' for l in levels]
+        colors = ['#ff4444' if 'CRITICAL' in l else
+                 '#ff6b6b' if 'ERROR' in l else
+                 '#ffa500' for l in levels]
 
-            plt.bar(levels, counts, color=colors)
-            plt.title('Log Severity Distribution', fontsize=14, fontweight='bold')
-            plt.ylabel('Count')
-            plt.xticks(rotation=45)
-            plt.grid(axis='y', alpha=0.3)
-            plt.tight_layout()
-            plt.show()
-        except Exception as e:
-            print(f"Visualization error (severity): {e}")
+        plt.bar(levels, counts, color=colors)
+        plt.title('Log Severity Distribution', fontsize=14, fontweight='bold')
+        plt.ylabel('Count')
+        plt.xlabel('Severity Level')
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
 
-    # Visualization - Event Types
+    # Chart 2: Security Event Types
     if event_type_stats:
-        try:
-            plt.figure(figsize=(10, 6))
-            event_types = [str(t) for t in event_type_stats.keys()]  # Convert to string
-            event_counts = [int(c) for c in event_type_stats.values()]  # Convert to int
+        plt.figure(figsize=(10, 6))
+        event_types = [str(t) for t in event_type_stats.keys()]
+        event_counts = [int(c) for c in event_type_stats.values()]
 
-            plt.bar(event_types, event_counts, color='#4CAF50')
-            plt.title('Security Event Types', fontsize=14, fontweight='bold')
-            plt.ylabel('Count')
-            plt.xticks(rotation=45, ha='right')
-            plt.grid(axis='y', alpha=0.3)
-            plt.tight_layout()
-            plt.show()
-        except Exception as e:
-            print(f"Visualization error (event types): {e}")
+        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
 
-    # N-gram analysis
+        plt.bar(event_types, event_counts, color=colors[:len(event_types)])
+        plt.title('Security Event Types Distribution', fontsize=14, fontweight='bold')
+        plt.ylabel('Count')
+        plt.xlabel('Event Type')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    # Chart 3: N-gram Patterns
     ngram_analysis = results.get('ngram_analysis', {})
     if ngram_analysis and ngram_analysis.get('top_ngrams'):
+        plt.figure(figsize=(10, 6))
+
+        top_ngrams = ngram_analysis['top_ngrams'][:10]
+        patterns = [n['pattern'][:30] for n in top_ngrams]
+        counts = [n['count'] for n in top_ngrams]
+
+        plt.barh(range(len(patterns)), counts, color='#6C5CE7')
+        plt.yticks(range(len(patterns)), patterns)
+        plt.title('Top Log Patterns', fontsize=14, fontweight='bold')
+        plt.xlabel('Count')
+        plt.gca().invert_yaxis()
+        plt.grid(axis='x', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    # N-gram text output
+    if ngram_analysis and ngram_analysis.get('top_ngrams'):
         print("\n" + "-"*40)
-        print("COMMON PATTERNS (N-GRAMS)")
+        print("🔍 COMMON PATTERNS")
         print("-"*40)
 
         for ngram in ngram_analysis['top_ngrams'][:10]:
@@ -353,41 +703,69 @@ def display_results(results: Dict):
             count = ngram.get('count', 0)
             print(f"  • {pattern}: {count}")
 
-    # Group analysis
+    # ============ GROUP ANALYSIS ============
+
     print("\n" + "="*70)
-    print("DETAILED GROUP ANALYSIS")
+    print("🔍 DETAILED GROUP ANALYSIS")
     print("="*70)
 
     analyzed_groups = results.get('analyzed_groups', [])
 
     for i, group in enumerate(analyzed_groups):
         print(f"\n{'─'*70}")
+
         event_type = group.get('event_type', 'UNKNOWN')
-        if event_type is None:
-            event_type = 'UNKNOWN'
-
-        print(f"Group {i+1}: {event_type}")
-        print(f"Size: {group.get('group_size', 0)} events")
-        print(f"Levels: {group.get('levels', {})}")
-
-        print("\nExamples:")
-        samples = group.get('samples', [])
-        for sample in samples[:2]:  # Limit to 2 samples for readability
-            if sample:
-                print(f"  • {sample[:150]}")  # Truncate long samples
-
-        print("\nExpert Analysis:")
-        analysis_text = group.get('analysis', 'No analysis available')
-        if analysis_text:
-            # Truncate very long analysis
-            if len(analysis_text) > 500:
-                print(f"  {analysis_text[:500]}...")
-            else:
-                print(f"  {analysis_text}")
+        if event_type is None or event_type == 'UNKNOWN':
+            event_type_emoji = '❓'
+        elif event_type == 'DDOS':
+            event_type_emoji = '🌊'
+        elif event_type == 'XSS':
+            event_type_emoji = '💉'
+        elif event_type == 'SCALE_INJECTION':
+            event_type_emoji = '📈'
+        elif event_type == 'TG':
+            event_type_emoji = '🤖'
         else:
-            print("  No analysis available")
+            event_type_emoji = '⚠️'
+
+        print(f"{event_type_emoji} GROUP {i+1}: {event_type}")
+        print(f"   Size: {group.get('group_size', 0)} events")
+        print(f"   Levels: {group.get('levels', {})}")
+
+        # Show examples
+        samples = group.get('samples', [])
+        if samples:
+            print(f"\n   📝 Example logs:")
+            for sample in samples[:2]:
+                if sample:
+                    if len(sample) > 120:
+                        print(f"   • {sample[:120]}...")
+                    else:
+                        print(f"   • {sample}")
+
+        # Show analysis
+        print(f"\n   💡 Expert Analysis:")
+        analysis_text = clean_analysis_text(group.get('analysis', ''))
+
+        # If analysis text is still too short or contains raw logs, show fallback
+        if len(analysis_text) < 30 or 'level=' in analysis_text:
+            analysis_text = f"""Analysis for {event_type} group:
+- {group.get('group_size', 0)} events detected
+- Severity levels: {group.get('levels', {})}
+- Review logs manually for detailed analysis"""
+
+        wrapped_lines = textwrap.wrap(analysis_text, width=65, initial_indent='   ', subsequent_indent='   ')
+        for line in wrapped_lines[:20]:
+            print(line)
+
+        if len(wrapped_lines) > 20:
+            print(f"   ... (analysis truncated)")
 
         print(f"{'─'*70}")
+
+    print("\n" + "="*70)
+    print("✅ ANALYSIS COMPLETE")
+    print("="*70)
 
 # Display results if available
 if 'results' in locals() and results:
