@@ -1,4 +1,4 @@
-# 🔒 CyberLogAI
+# 🔒 Log-Analyzer
 
 **AI-Powered Log Analyzer for Cybersecurity Threat Detection**
 
@@ -26,13 +26,13 @@
 ### Installation
 
 ```bash
-git clone https://github.com/beefpot-govnoed/CyberLogAI.git
+git clone https://github.com/beefpot-govnoed/Log-Analyzer.git
 cd CyberLogAI
 ```
 
 ### Usage in Google Colab
 
-1. Open `CyberLogAI.ipynb` in Google Colab
+1. Open `main.ipynb` in Google Colab
 2. Select **Runtime → Change runtime type → GPU T4**
 3. Run all cells
 4. Upload your `.log` file when prompted
@@ -55,9 +55,9 @@ cd CyberLogAI
 ## 📁 Project Structure
 
 ```
-CyberLogAI/
-├── CyberLogAI.ipynb    # Main notebook
-├── log_analyzer.py     # Python script version
+Log-Analyzer/
+├── main.ipynb    # Main notebook
+├── main.py     # Python script version
 ├── requirements.txt    # Dependencies
 └── README.md           # Documentation
 ```
