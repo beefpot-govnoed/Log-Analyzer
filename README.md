@@ -27,7 +27,7 @@
 
 ```bash
 git clone https://github.com/beefpot-govnoed/Log-Analyzer.git
-cd CyberLogAI
+cd Log-Analyzer
 ```
 
 ### Usage in Google Colab
